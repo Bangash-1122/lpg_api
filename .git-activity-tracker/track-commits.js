@@ -31,6 +31,20 @@ function requireEnv(name) {
   return value;
 }
 
+function spreadsheetIdFrom(value) {
+  const cleaned = value.trim().replace(/^['"]|['"]$/g, '');
+  const fromUrl = cleaned.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (fromUrl) {
+    console.log('GOOGLE_SHEET_ID is a spreadsheet URL. Using the id from that URL.');
+    return fromUrl[1];
+  }
+  if (/^https?:\/\//i.test(cleaned) || !/^[a-zA-Z0-9-_]+$/.test(cleaned)) {
+    console.error('GOOGLE_SHEET_ID must be the spreadsheet id or a full Google Sheets URL.');
+    process.exit(1);
+  }
+  return cleaned;
+}
+
 function loadCredentials() {
   const raw = requireEnv('GOOGLE_SERVICE_ACCOUNT_JSON');
   let credentials;
@@ -170,7 +184,7 @@ async function ensureSheet(client, spreadsheetId, clientEmail) {
     }
     if (error.status === 404) {
       throw new Error(
-        'Spreadsheet was not found. Check GOOGLE_SHEET_ID and share that spreadsheet with the service account.'
+        `Spreadsheet was not found for ${clientEmail}. In Google Sheets, click Share and add that address as an Editor. Access via "anyone with the link" does not apply to a service account.`
       );
     }
     throw error;
@@ -232,7 +246,7 @@ async function appendRows(client, spreadsheetId, rows) {
 
 async function main() {
   const credentials = loadCredentials();
-  const spreadsheetId = requireEnv('GOOGLE_SHEET_ID');
+  const spreadsheetId = spreadsheetIdFrom(requireEnv('GOOGLE_SHEET_ID'));
   const repository = requireEnv('GITHUB_REPOSITORY');
   const branch = (process.env.GITHUB_REF_NAME || '').trim();
   const server = (process.env.GITHUB_SERVER_URL || 'https://github.com').replace(/\/$/, '');
