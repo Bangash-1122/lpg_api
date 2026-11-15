@@ -1,0 +1,16 @@
+{
+  "name": "git-activity-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Records commits pushed to main in a Google Spreadsheet.",
+  "main": "track-commits.js",
+  "scripts": {
+    "track": "node track-commits.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "google-auth-library": "^10.5.0"
+  }
+}
