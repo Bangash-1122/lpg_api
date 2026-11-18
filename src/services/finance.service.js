@@ -998,7 +998,11 @@ async function listSales(query) {
   const { page, limit, skip } = parsePagination(query);
   const filter = await buildSaleListFilter(query);
   const findQuery = populateQuery(
-    Sale.find(filter).sort({ invoiceDate: -1, createdAt: -1 }).skip(skip).limit(limit),
+    Sale.find(filter)
+      .collation({ locale: 'en', numericOrdering: true })
+      .sort({ invoiceNumber: -1, createdAt: -1 })
+      .skip(skip)
+      .limit(limit),
     SALE_POPULATE
   );
   const [items, total, summary] = await Promise.all([
