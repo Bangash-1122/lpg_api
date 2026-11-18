@@ -9,6 +9,12 @@ const accountSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+    clientOperationId: {
+      type: String,
+      trim: true,
+      unique: true,
+      sparse: true,
+    },
     accountName: {
       type: String,
       required: [true, 'accountName is required'],
