@@ -17,6 +17,13 @@ const { writeAudit } = require('./audit.service');
 const { receiptFinance } = require('./finance.service');
 const { recomputeTankCosts } = require('./gasCost.service');
 const {
+  operationKey,
+  findApplied,
+  remember,
+  isOperationConflict,
+  replayIfApplied,
+} = require('./idempotency.service');
+const {
   RECEIPT_STATUSES,
   BATCH_STATUSES,
   PAYMENT_METHOD_OPTIONS,
@@ -81,19 +88,35 @@ function receiptPaymentBalances(totalAmount, paidAmount) {
   return receiptFinance.deriveBalances(totalAmount, paidAmount, 0);
 }
 
+function dayWindow(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const utcMidnight = date.getUTCHours() === 0
+    && date.getUTCMinutes() === 0
+    && date.getUTCSeconds() === 0
+    && date.getUTCMilliseconds() === 0;
+  const start = utcMidnight
+    ? new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
+    : new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  return { start, end: new Date(start.getTime() + 24 * 60 * 60 * 1000) };
+}
+
 function applyDateRange(filter, field, query) {
   if (query.date) {
-    const start = new Date(query.date);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 1);
-    filter[field] = { $gte: start, $lt: end };
+    const window = dayWindow(query.date);
+    if (window) filter[field] = { $gte: window.start, $lt: window.end };
     return filter;
   }
   if (!query.startDate && !query.endDate) return filter;
   filter[field] = {};
-  if (query.startDate) filter[field].$gte = new Date(query.startDate);
-  if (query.endDate) filter[field].$lte = new Date(query.endDate);
+  if (query.startDate) {
+    const window = dayWindow(query.startDate);
+    if (window) filter[field].$gte = window.start;
+  }
+  if (query.endDate) {
+    const window = dayWindow(query.endDate);
+    if (window) filter[field].$lt = window.end;
+  }
   return filter;
 }
 
@@ -719,10 +742,12 @@ async function listFillings(query) {
     FILLING_POPULATE
   );
 
+  const summaryPipeline = Object.keys(filter).length ? [{ $match: filter }] : [];
   const [items, total, summaryAgg, pending] = await Promise.all([
     findQuery.lean(),
     FillingBatch.countDocuments(filter),
     FillingBatch.aggregate([
+      ...summaryPipeline,
       {
         $group: {
           _id: null,
@@ -743,7 +768,11 @@ async function listFillings(query) {
         },
       },
     ]),
-    FillingBatch.countDocuments({ batchStatus: 'pending' }),
+    FillingBatch.countDocuments(
+      filter.batchStatus && filter.batchStatus !== 'pending'
+        ? { _id: { $exists: false } }
+        : { ...filter, batchStatus: 'pending' }
+    ),
   ]);
 
   const stats = summaryAgg[0] || {
@@ -1198,7 +1227,19 @@ async function resolveBatchLines(body, session, existingDoc) {
 }
 
 async function createFilling(body, req) {
-  const result = await withTransaction(async (session) => {
+  const operationId = operationKey(req, body);
+  if (operationId) {
+    const replay = await replayIfApplied(operationId, getFillingById);
+    if (replay) return replay;
+  }
+
+  let result;
+  try {
+    result = await withTransaction(async (session) => {
+    if (operationId) {
+      const prior = await findApplied(operationId, session);
+      if (prior?.entityId) return { replayId: prior.entityId };
+    }
     await assertEmployee(body.operatorEmployeeId, session);
     const summary = await resolveBatchLines(body, session);
     const storageTankId = await resolveTankId(body.storageTankId, session);
@@ -1229,6 +1270,7 @@ async function createFilling(body, req) {
       createdByUserId: req.user._id,
       remarks: body.remarks || '',
       batchStatus,
+      ...(operationId ? { clientOperationId: operationId } : {}),
     };
 
     const [doc] = await FillingBatch.create([payload], { session });
@@ -1247,6 +1289,15 @@ async function createFilling(body, req) {
       },
     });
 
+    if (operationId) {
+      await remember(session, {
+        operationId,
+        entity: 'filling-batches',
+        action: 'create',
+        entityId: doc._id,
+      });
+    }
+
     return {
       id: doc._id,
       inventoryUpdate: {
@@ -1261,8 +1312,16 @@ async function createFilling(body, req) {
         applied: batchStatus === 'completed',
       },
     };
-  });
+    });
+  } catch (error) {
+    if (operationId && isOperationConflict(error)) {
+      const replay = await replayIfApplied(operationId, getFillingById);
+      if (replay) return replay;
+    }
+    throw error;
+  }
 
+  if (result?.replayId) return getFillingById(result.replayId);
   invalidateOps();
   const batch = await getFillingById(result.id);
   return {
@@ -1273,7 +1332,19 @@ async function createFilling(body, req) {
 }
 
 async function updateFilling(id, body, req) {
-  const result = await withTransaction(async (session) => {
+  const operationId = operationKey(req, body);
+  if (operationId) {
+    const replay = await replayIfApplied(operationId, getFillingById);
+    if (replay) return replay;
+  }
+
+  let result;
+  try {
+    result = await withTransaction(async (session) => {
+    if (operationId) {
+      const prior = await findApplied(operationId, session);
+      if (prior?.entityId) return { replayId: prior.entityId };
+    }
     const existing = await FillingBatch.findById(id).session(session);
     if (!existing) {
       throw new ApiError(404, 'FillingBatch not found');
@@ -1346,6 +1417,7 @@ async function updateFilling(id, body, req) {
     existing.batchStatus = nextStatus;
     if (body.fillingDate !== undefined) existing.fillingDate = body.fillingDate;
     if (body.remarks !== undefined) existing.remarks = body.remarks;
+    if (operationId) existing.clientOperationId = operationId;
     await existing.save({ session });
     await recomputeTankCosts([oldValues.storageTankId, nextTankId], session);
 
@@ -1360,9 +1432,26 @@ async function updateFilling(id, body, req) {
       newValues: body,
     });
 
-    return existing._id;
-  });
+    if (operationId) {
+      await remember(session, {
+        operationId,
+        entity: 'filling-batches',
+        action: 'update',
+        entityId: existing._id,
+      });
+    }
 
+    return existing._id;
+    });
+  } catch (error) {
+    if (operationId && isOperationConflict(error)) {
+      const replay = await replayIfApplied(operationId, getFillingById);
+      if (replay) return replay;
+    }
+    throw error;
+  }
+
+  if (result?.replayId) return getFillingById(result.replayId);
   invalidateOps();
   return getFillingById(result);
 }
