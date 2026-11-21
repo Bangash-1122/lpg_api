@@ -566,8 +566,10 @@ async function inventoryListSummary() {
         title: cylinderCardTitle(item, type),
         itemCategory: item.itemCategory,
         categoryLabel: categoryLabelOf(item.itemCategory),
+        cylinderTypeId: type?._id || item.cylinderTypeId || null,
         capacityKg: type?.capacityKg ?? null,
         currentQuantity: item.currentQuantity || 0,
+        minimumStockLevel: item.minimumStockLevel || 0,
         hint: cylinderCardHint(item, status),
         ...status,
       };

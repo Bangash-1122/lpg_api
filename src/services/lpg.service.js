@@ -464,6 +464,29 @@ async function incrementFilled(itemId, count, session) {
   );
 }
 
+async function changeEmptyStock(cylinderTypeId, delta, session) {
+  const item = await findCylinderStock(cylinderTypeId, 'empty-cylinder', session);
+  if (!item || !delta) return null;
+  if (delta < 0) {
+    const updated = await InventoryItem.findOneAndUpdate(
+      { _id: item._id, currentQuantity: { $gte: -delta } },
+      { $inc: { currentQuantity: delta } },
+      { new: true, session }
+    );
+    if (!updated) {
+      const cylinderType = await CylinderType.findById(cylinderTypeId).session(session);
+      const name = cylinderType?.typeName || 'this cylinder type';
+      throw new ApiError(400, `Not enough empty cylinders for ${name}`);
+    }
+    return updated;
+  }
+  return InventoryItem.findByIdAndUpdate(
+    item._id,
+    { $inc: { currentQuantity: delta } },
+    { new: true, session }
+  );
+}
+
 async function restoreTank(tankId, quantityKg, session) {
   const tank = await StorageTank.findByIdAndUpdate(
     tankId,
@@ -1040,6 +1063,7 @@ async function applyFillingLines({ storageTankId, lines }, session) {
       throw new ApiError(400, `No active filled inventory item for ${name}`);
     }
     await incrementFilled(filledItem._id, line.cylinderCount, session);
+    await changeEmptyStock(line.cylinderTypeId, -line.cylinderCount, session);
   }
 
   return tank;
@@ -1062,6 +1086,7 @@ async function reverseFillingLines({ storageTankId, lines }, session) {
       const name = cylinderType?.typeName || 'this cylinder type';
       throw new ApiError(400, `Cannot reverse filling; filled stock for ${name} was already used`);
     }
+    await changeEmptyStock(line.cylinderTypeId, line.cylinderCount, session);
   }
 }
 
