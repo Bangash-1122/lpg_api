@@ -9,6 +9,12 @@ const employeeSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+    clientOperationId: {
+      type: String,
+      trim: true,
+      unique: true,
+      sparse: true,
+    },
     fullName: {
       type: String,
       required: [true, 'fullName is required'],
