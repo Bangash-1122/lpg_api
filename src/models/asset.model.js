@@ -14,6 +14,12 @@ const assetSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+    clientOperationId: {
+      type: String,
+      trim: true,
+      unique: true,
+      sparse: true,
+    },
     assetName: {
       type: String,
       required: [true, 'assetName is required'],

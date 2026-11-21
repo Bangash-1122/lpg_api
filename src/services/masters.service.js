@@ -1282,6 +1282,29 @@ const maintenanceRecord = createMasterService({
   },
 });
 
+async function assetListSummary(query = {}) {
+  const filter = {};
+  if (query.assetCategory) filter.assetCategory = query.assetCategory;
+  if (query.assetStatus) filter.assetStatus = query.assetStatus;
+  if (query.assignedEmployeeId) filter.assignedEmployeeId = query.assignedEmployeeId;
+  if (query.search) {
+    const regex = { $regex: query.search, $options: 'i' };
+    filter.$or = ['assetCode', 'assetName', 'serialNumber', 'locationName', 'manufacturerName']
+      .map((field) => ({ [field]: regex }));
+  }
+  const [row] = await Asset.aggregate([
+    { $match: filter },
+    { $group: { _id: null, purchase: { $sum: '$purchaseCostAmount' }, book: { $sum: '$currentBookValueAmount' } } },
+  ]);
+  const purchase = roundMoney(row?.purchase);
+  const book = roundMoney(row?.book);
+  return {
+    totalAssetValue: purchase,
+    totalDepreciation: roundMoney(purchase - book),
+    netBookValue: book,
+  };
+}
+
 const asset = createMasterService({
   Model: Asset,
   entityName: 'Asset',
@@ -1309,6 +1332,7 @@ const asset = createMasterService({
     paymentMethods: PAYMENT_METHOD_OPTIONS,
   }),
   formOptions: assetFormOptions,
+  listSummary: assetListSummary,
   useTransaction: true,
   prepareCreate: async (body, req, session) => {
     await assertWorkEmployee(body.assignedEmployeeId);

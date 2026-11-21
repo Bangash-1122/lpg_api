@@ -9,6 +9,12 @@ const maintenanceRecordSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+    clientOperationId: {
+      type: String,
+      trim: true,
+      unique: true,
+      sparse: true,
+    },
     assetId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Asset',

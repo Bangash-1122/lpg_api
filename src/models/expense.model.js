@@ -9,6 +9,12 @@ const expenseSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+    clientOperationId: {
+      type: String,
+      trim: true,
+      unique: true,
+      sparse: true,
+    },
     expenseCategoryId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'ExpenseCategory',

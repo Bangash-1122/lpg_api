@@ -2043,8 +2043,9 @@ async function nextExpenseNumber(session) {
   return nextSequentialCode(Expense, 'expenseNumber', 'EXP', 4, session);
 }
 
-async function expenseSummary() {
-  const monthMatch = { expenseDate: currentMonthRange() };
+async function expenseSummary(filter = {}) {
+  const monthMatch = { ...filter };
+  if (!filter.expenseDate) monthMatch.expenseDate = currentMonthRange();
   const [totals, byCategory] = await Promise.all([
     Expense.aggregate([
       { $match: monthMatch },
@@ -2107,7 +2108,7 @@ async function listExpenses(query) {
   const [items, total, summary, categories] = await Promise.all([
     findQuery.lean(),
     Expense.countDocuments(filter),
-    expenseSummary(),
+    expenseSummary(filter),
     ExpenseCategory.find({ isActive: true }).select('categoryCode categoryName').sort({ categoryName: 1 }).lean(),
   ]);
 
@@ -3210,7 +3211,19 @@ async function removePayment(id, req) {
 }
 
 async function createExpense(body, req) {
-  const result = await withTransaction(async (session) => {
+  const operationId = operationKey(req, body);
+  if (operationId) {
+    const replay = await replayIfApplied(operationId, getExpenseById);
+    if (replay) return replay;
+  }
+
+  let result;
+  try {
+    result = await withTransaction(async (session) => {
+    if (operationId) {
+      const prior = await findApplied(operationId, session);
+      if (prior?.entityId) return { replayId: prior.entityId };
+    }
     await assertCategory(body.expenseCategoryId, session);
     const paidFromAccountId = pickExpenseAccountId(body);
     const expenseAmount = roundMoney(body.expenseAmount);
@@ -3251,6 +3264,7 @@ async function createExpense(body, req) {
           remarks: body.remarks || '',
           recordedByUserId: req.user._id,
           approvedByUserId: expenseStatus === 'paid' ? req.user._id : null,
+          ...(operationId ? { clientOperationId: operationId } : {}),
         },
       ],
       { session }
@@ -3264,15 +3278,42 @@ async function createExpense(body, req) {
       entityId: doc._id,
       newValues: { expenseNumber, expenseAmount, expenseStatus, paidFromAccountId },
     });
+    if (operationId) {
+      await remember(session, {
+        operationId,
+        entity: 'expenses',
+        action: 'create',
+        entityId: doc._id,
+      });
+    }
     return doc._id;
-  });
+    });
+  } catch (error) {
+    if (operationId && isOperationConflict(error)) {
+      const replay = await replayIfApplied(operationId, getExpenseById);
+      if (replay) return replay;
+    }
+    throw error;
+  }
 
   invalidateFinance();
-  return getExpenseById(result);
+  return getExpenseById(result?.replayId || result);
 }
 
 async function updateExpense(id, body, req) {
-  const result = await withTransaction(async (session) => {
+  const operationId = operationKey(req, body);
+  if (operationId) {
+    const replay = await replayIfApplied(operationId, getExpenseById);
+    if (replay) return replay;
+  }
+
+  let result;
+  try {
+    result = await withTransaction(async (session) => {
+    if (operationId) {
+      const prior = await findApplied(operationId, session);
+      if (prior?.entityId) return { replayId: prior.entityId };
+    }
     const expense = await Expense.findById(id).session(session);
     if (!expense) throw new ApiError(404, 'Expense not found');
 
@@ -3341,6 +3382,7 @@ async function updateExpense(id, body, req) {
     if (body.referenceNumber !== undefined) expense.referenceNumber = body.referenceNumber;
     if (body.paymentDate !== undefined) expense.paymentDate = body.paymentDate;
     if (body.remarks !== undefined) expense.remarks = body.remarks;
+    if (operationId) expense.clientOperationId = operationId;
     await expense.save({ session });
 
     await writeAudit({
@@ -3352,11 +3394,26 @@ async function updateExpense(id, body, req) {
       entityId: expense._id,
       newValues: body,
     });
+    if (operationId) {
+      await remember(session, {
+        operationId,
+        entity: 'expenses',
+        action: 'update',
+        entityId: expense._id,
+      });
+    }
     return expense._id;
-  });
+    });
+  } catch (error) {
+    if (operationId && isOperationConflict(error)) {
+      const replay = await replayIfApplied(operationId, getExpenseById);
+      if (replay) return replay;
+    }
+    throw error;
+  }
 
   invalidateFinance();
-  return getExpenseById(result);
+  return getExpenseById(result?.replayId || result);
 }
 
 async function removeExpense(id, req) {
