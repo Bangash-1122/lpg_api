@@ -9,6 +9,12 @@ const lpgReceiptSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+    clientOperationId: {
+      type: String,
+      trim: true,
+      unique: true,
+      sparse: true,
+    },
     supplierId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Supplier',

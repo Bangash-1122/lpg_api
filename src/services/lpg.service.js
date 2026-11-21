@@ -648,6 +648,11 @@ async function listReceipts(query) {
   }
 
   const { start: monthStart, end: monthEnd } = currentMonthRange();
+  const hasDate = Boolean(query.date || query.startDate || query.endDate);
+  const monthMatch = hasDate ? filter : { ...filter, receivedAt: { $gte: monthStart, $lt: monthEnd } };
+  const pendingMatch = filter.receiptStatus && filter.receiptStatus !== 'pending'
+    ? { _id: { $exists: false } }
+    : { ...filter, receiptStatus: 'pending' };
   const findQuery = populateQuery(
     LPGReceipt.find(filter).sort({ receivedAt: -1, createdAt: -1 }).skip(skip).limit(limit),
     RECEIPT_POPULATE
@@ -657,7 +662,7 @@ async function listReceipts(query) {
     findQuery.lean(),
     LPGReceipt.countDocuments(filter),
     LPGReceipt.aggregate([
-      { $match: { receivedAt: { $gte: monthStart, $lt: monthEnd } } },
+      { $match: monthMatch },
       {
         $group: {
           _id: null,
@@ -667,7 +672,7 @@ async function listReceipts(query) {
         },
       },
     ]),
-    LPGReceipt.countDocuments({ receiptStatus: 'pending' }),
+    LPGReceipt.countDocuments(pendingMatch),
     LPGReceipt.aggregate([
       { $match: { receiptStatus: 'confirmed' } },
       { $group: { _id: null, outstanding: { $sum: '$outstandingAmount' } } },
@@ -798,7 +803,19 @@ async function listFillings(query) {
 }
 
 async function createReceipt(body, req) {
-  const result = await withTransaction(async (session) => {
+  const operationId = operationKey(req, body);
+  if (operationId) {
+    const replay = await replayIfApplied(operationId, getReceiptById);
+    if (replay) return replay;
+  }
+
+  let result;
+  try {
+    result = await withTransaction(async (session) => {
+    if (operationId) {
+      const prior = await findApplied(operationId, session);
+      if (prior?.entityId) return { replayId: prior.entityId };
+    }
     await assertSupplier(body.supplierId, session);
     await assertEmployee(body.receivedByEmployeeId, session);
     const tank = await StorageTank.findById(await resolveTankId(body.storageTankId, session)).session(session);
@@ -837,6 +854,7 @@ async function createReceipt(body, req) {
       receivedByEmployeeId: body.receivedByEmployeeId,
       remarks: body.remarks || '',
       receiptStatus,
+      ...(operationId ? { clientOperationId: operationId } : {}),
     };
 
     const [doc] = await LPGReceipt.create([payload], { session });
@@ -873,6 +891,15 @@ async function createReceipt(body, req) {
       },
     });
 
+    if (operationId) {
+      await remember(session, {
+        operationId,
+        entity: 'lpg-receipts',
+        action: 'create',
+        entityId: doc._id,
+      });
+    }
+
     return {
       id: doc._id,
       inventoryUpdate: {
@@ -883,8 +910,16 @@ async function createReceipt(body, req) {
         applied: receiptStatus === 'confirmed',
       },
     };
-  });
+    });
+  } catch (error) {
+    if (operationId && isOperationConflict(error)) {
+      const replay = await replayIfApplied(operationId, getReceiptById);
+      if (replay) return replay;
+    }
+    throw error;
+  }
 
+  if (result?.replayId) return getReceiptById(result.replayId);
   invalidateOps();
   const receipt = await getReceiptById(result.id);
   return {
@@ -895,7 +930,19 @@ async function createReceipt(body, req) {
 }
 
 async function updateReceipt(id, body, req) {
-  const result = await withTransaction(async (session) => {
+  const operationId = operationKey(req, body);
+  if (operationId) {
+    const replay = await replayIfApplied(operationId, getReceiptById);
+    if (replay) return replay;
+  }
+
+  let result;
+  try {
+    result = await withTransaction(async (session) => {
+    if (operationId) {
+      const prior = await findApplied(operationId, session);
+      if (prior?.entityId) return { replayId: prior.entityId };
+    }
     const existing = await LPGReceipt.findById(id).session(session);
     if (!existing) {
       throw new ApiError(404, 'LPGReceipt not found');
@@ -986,6 +1033,7 @@ async function updateReceipt(id, body, req) {
     if (body.referenceNumber !== undefined || body.payment?.referenceNumber !== undefined) {
       existing.referenceNumber = pickReceiptReferenceNumber(body) || '';
     }
+    if (operationId) existing.clientOperationId = operationId;
     await existing.save({ session });
     await recomputeTankCosts([oldValues.storageTankId, nextTankId], session);
 
@@ -1020,9 +1068,26 @@ async function updateReceipt(id, body, req) {
       newValues: body,
     });
 
-    return existing._id;
-  });
+    if (operationId) {
+      await remember(session, {
+        operationId,
+        entity: 'lpg-receipts',
+        action: 'update',
+        entityId: existing._id,
+      });
+    }
 
+    return existing._id;
+    });
+  } catch (error) {
+    if (operationId && isOperationConflict(error)) {
+      const replay = await replayIfApplied(operationId, getReceiptById);
+      if (replay) return replay;
+    }
+    throw error;
+  }
+
+  if (result?.replayId) return getReceiptById(result.replayId);
   invalidateOps();
   return getReceiptById(result);
 }
