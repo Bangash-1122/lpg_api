@@ -14,6 +14,12 @@ const cylinderTypeSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+    clientOperationId: {
+      type: String,
+      trim: true,
+      unique: true,
+      sparse: true,
+    },
     typeName: {
       type: String,
       required: [true, 'typeName is required'],
