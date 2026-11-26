@@ -42,6 +42,10 @@ const chat = asyncHandler(async (req, res) => {
         requestId: result.requestId,
         answer: result.answer,
         source: result.source,
+        workflowId: result.workflowId || null,
+        pageLink: result.pageLink || null,
+        steps: result.steps || [],
+        coverageStatus: result.coverageStatus || null,
       },
     });
   } catch (err) {

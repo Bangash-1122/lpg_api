@@ -2,7 +2,12 @@ const crypto = require('crypto');
 const env = require('../config/env');
 const ApiError = require('../utils/ApiError');
 const { ChatRequestWindow } = require('../models');
-const { getWorkflowsForPermissions } = require('../chat/knowledge');
+const { matchWorkflows, resolvePageLink, ERP_WORKFLOWS } = require('../chat/knowledge');
+const {
+  isOutOfScope,
+  renderVerifiedWorkflowSteps,
+  validateAndSanitizeAnswer,
+} = require('../chat/answer.validation');
 const chatProvider = require('./chatProvider.service');
 
 /**
@@ -28,10 +33,6 @@ function hashQuestion(normalizedText) {
  *
  * Rule: A reply created under broader permissions is ineligible after access changes.
  * Every permission granted when the answer was created must still be present in the user's current permissions.
- *
- * @param {string[]} answerPermissions - Permissions held when answer was generated
- * @param {string[]} currentPermissions - Permissions currently held by user
- * @returns {boolean} True if still eligible
  */
 function isAnswerEligible(answerPermissions = [], currentPermissions = []) {
   if (!answerPermissions || answerPermissions.length === 0) return true;
@@ -45,17 +46,11 @@ function isAnswerEligible(answerPermissions = [], currentPermissions = []) {
  * Coordinates:
  * 1. User identification & permissions from auth middleware.
  * 2. UUID & fingerprint checks (rejection of UUID reuse with different text, deduplication).
- * 3. Atomic generation slot reservation via MongoDB.
- * 4. Provider call with allowed workflows.
- * 5. Completion or safe error handling with expiry.
- * 6. Permission-scoped cached response handling.
- *
- * @param {Object} params
- * @param {Object} params.user - Authenticated user model
- * @param {string[]} params.permissionCodes - User's effective permissions
- * @param {string} params.requestId - Client UUID
- * @param {string} params.question - Validated raw question string
- * @returns {Promise<{ status: string, requestId: string, answer?: string, retryAfter?: number, source?: string }>}
+ * 3. Scope enforcement (unrelated topics get an ERP-only prompt).
+ * 4. Grounding & permission restriction checks.
+ * 5. Atomic generation slot reservation via MongoDB.
+ * 6. Provider call with allowed workflows.
+ * 7. Resilient fallback: Always returns verified steps from knowledge base if AI provider fails.
  */
 async function processChatRequest({ user, permissionCodes = [], requestId, question }) {
   const userId = user._id;
@@ -97,10 +92,12 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
             status: 'completed',
             requestId,
             answer: uuidMatch.answer,
+            workflowId: uuidMatch.workflowId || null,
+            pageLink: uuidMatch.pageLink || null,
+            steps: uuidMatch.steps || [],
             source: 'cache',
           };
         }
-        // If permissions were reduced, the cached answer is ineligible. Proceed to re-generate.
       }
     }
 
@@ -123,6 +120,9 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
             status: 'completed',
             requestId,
             answer: fpMatch.answer,
+            workflowId: fpMatch.workflowId || null,
+            pageLink: fpMatch.pageLink || null,
+            steps: fpMatch.steps || [],
             source: 'cache',
           };
         }
@@ -130,20 +130,114 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
     }
   }
 
-  // 3. Reserve the generation slot atomically.
-  // One conditional MongoDB operation checks for active match, counts attempts in rolling window,
-  // and reserves a pending entry.
+  // 3. Out-of-scope check: For unrelated requests (e.g. drafting an email, weather, general chat),
+  // return a short ERP-only reply directly from the backend without consuming quota or provider calls.
+  if (isOutOfScope(question)) {
+    return {
+      status: 'completed',
+      requestId,
+      answer: 'I can help with Brother LPG ERP workflows. Which ERP task are you working on?',
+      source: 'scope-notice',
+    };
+  }
+
+  // 4. Grounding & Permission check: Match the question against verified knowledge base entries.
+  const {
+    matchedWorkflows,
+    isTopUnauthorized,
+    unauthorizedMatch,
+    bestMatch,
+    isAmbiguous,
+    ambiguousMatches,
+    isFollowUp,
+    pageLink,
+  } = matchWorkflows(question, permissionCodes, existingWindow?.lastWorkflowId);
+
+  // 4a. If the question matches an action that requires permissions the user lacks:
+  // State that permission is required only when the backend confirms that the user lacks it.
+  if (isTopUnauthorized && unauthorizedMatch) {
+    return {
+      status: 'completed',
+      requestId,
+      answer: `To ${unauthorizedMatch.title.toLowerCase()}, you need the '${unauthorizedMatch.requiredPermission}' permission. Please contact your administrator for access.`,
+      workflowId: unauthorizedMatch.id,
+      pageLink: null,
+      steps: [],
+      source: 'permission-restriction',
+      coverageStatus: unauthorizedMatch.status,
+    };
+  }
+
+  // 4b. If the question is ambiguous between multiple actions (e.g. "how to record payment"):
+  // Ask one focused question to clarify the user's intent.
+  if (isAmbiguous && ambiguousMatches.length >= 2) {
+    const action1 = ambiguousMatches[0].title.toLowerCase();
+    const action2 = ambiguousMatches[1].title.toLowerCase();
+    return {
+      status: 'completed',
+      requestId,
+      answer: `Are you looking to ${action1} or ${action2}? Please specify so I can provide the exact steps.`,
+      workflowId: null,
+      pageLink: null,
+      steps: [],
+      source: 'clarification',
+    };
+  }
+
+  // 4c. If contextual follow-up within the last authorized workflow (e.g. "Which account do I choose?"):
+  if (isFollowUp && bestMatch) {
+    let followUpAnswer = null;
+    const qLower = normalizedText;
+    if (
+      (qLower.includes('which account') ||
+        qLower.includes('konsa account') ||
+        qLower.includes('what account') ||
+        qLower.includes('which bank') ||
+        qLower.includes('konsa bank')) &&
+      bestMatch.followUpAnswers?.account
+    ) {
+      followUpAnswer = `${bestMatch.followUpAnswers.account}\n\nYou can proceed on the "${bestMatch.screenLabel}" screen.`;
+    } else if (
+      (qLower.includes('what do i do next') ||
+        qLower.includes('what next') ||
+        qLower.includes('what is next') ||
+        qLower.includes('ab kya')) &&
+      bestMatch.followUpAnswers?.next_steps
+    ) {
+      followUpAnswer = `${bestMatch.followUpAnswers.next_steps}`;
+    }
+
+    if (followUpAnswer) {
+      await ChatRequestWindow.updateOne(
+        { userId },
+        { $set: { lastWorkflowId: bestMatch.id, lastWorkflowAt: now } }
+      );
+
+      return {
+        status: 'completed',
+        requestId,
+        answer: followUpAnswer,
+        workflowId: bestMatch.id,
+        pageLink: pageLink || resolvePageLink(bestMatch, permissionCodes),
+        steps: bestMatch.steps || [],
+        source: 'contextual-followup',
+        coverageStatus: bestMatch.status || 'verified',
+      };
+    }
+  }
+
+  // 5. Reserve the generation slot atomically.
   const reservationId = crypto.randomUUID();
   const pendingExpiry = new Date(now.getTime() + providerTimeoutMs + 5000);
   const docExpiry = new Date(now.getTime() + Math.max(quotaWindowMs, cacheTtlMs) + 60000);
 
-  // Ensure document exists for user
   await ChatRequestWindow.updateOne(
     { userId },
     {
       $setOnInsert: {
         userId,
         requests: [],
+        lastWorkflowId: null,
         expiresAt: docExpiry,
       },
     },
@@ -156,6 +250,9 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
     questionFingerprint,
     status: 'pending',
     answer: null,
+    workflowId: bestMatch?.id || null,
+    pageLink: pageLink || null,
+    steps: bestMatch?.steps || [],
     effectivePermissions: permissionCodes,
     error: null,
     createdAt: now,
@@ -166,7 +263,6 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
   const reservedWindow = await ChatRequestWindow.findOneAndUpdate(
     {
       userId,
-      // No active pending entry for this requestId or questionFingerprint
       $nor: [
         {
           requests: {
@@ -178,7 +274,6 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
           },
         },
       ],
-      // Quota check inside the rolling window
       $expr: {
         $lt: [
           {
@@ -206,11 +301,9 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
     { new: true }
   );
 
-  // If reservation failed: determine if it was concurrent duplicate or rate limit exceeded
   if (!reservedWindow) {
     const currentWindow = await ChatRequestWindow.findOne({ userId }).lean();
 
-    // Check if another concurrent request just reserved this fingerprint or requestId
     const concurrent = currentWindow?.requests?.find(
       (r) =>
         (r.requestId === requestId || r.questionFingerprint === questionFingerprint) &&
@@ -226,7 +319,6 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
       };
     }
 
-    // Otherwise, rolling quota limit has been exceeded
     const windowRequests = (currentWindow?.requests || [])
       .filter((r) => new Date(r.createdAt) >= windowStart && ['pending', 'completed'].includes(r.status))
       .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
@@ -243,33 +335,37 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
     throw rateLimitError;
   }
 
-  // 4. Generate the answer via the provider
+  // 6. Generate answer via provider with graceful fallback resilience:
+  // For a known and authorized workflow, display verified steps even if the AI provider times out or returns 503.
   let generatedAnswer;
+  let source = 'generated';
+
   try {
-    const allowedWorkflows = getWorkflowsForPermissions(permissionCodes);
-    generatedAnswer = await chatProvider.generateAnswer({
+    const rawAnswer = await chatProvider.generateAnswer({
       question,
-      allowedWorkflows,
+      allowedWorkflows: matchedWorkflows.length > 0 ? matchedWorkflows : [],
+    });
+
+    generatedAnswer = validateAndSanitizeAnswer({
+      answerText: rawAnswer,
+      matchedWorkflow: bestMatch,
+      allowedWorkflows: matchedWorkflows,
     });
   } catch (providerError) {
-    // 5. Record failed entry with safe error state, tied to this specific reservationId
-    await ChatRequestWindow.updateOne(
-      {
-        userId,
-        'requests.reservationId': reservationId,
-      },
-      {
-        $set: {
-          'requests.$.status': 'failed',
-          'requests.$.error': providerError.message || 'Provider failed',
-          'requests.$.completedAt': new Date(),
-        },
-      }
-    );
-    throw providerError;
+    // If the provider fails (e.g. 503 high demand, 504 timeout, or network failure),
+    // and we have a verified workflow match: display verified steps directly from knowledge.js.
+    if (bestMatch) {
+      generatedAnswer = renderVerifiedWorkflowSteps(bestMatch);
+      source = 'verified-fallback';
+    } else {
+      // If no specific workflow could be identified and provider failed, provide a helpful ERP navigation guide
+      generatedAnswer =
+        'A verified ERP workflow guide is currently unavailable for this request. Please specify which screen or task you need assistance with (e.g. Sales, Customers, LPG Receipts, or Payments).';
+      source = 'help-fallback';
+    }
   }
 
-  // 5. Finish the request: Save completed entry with answer tied to specific reservationId
+  // 7. Finish the request: Save completed entry with answer
   const completedAt = new Date();
   const completionCacheExpiry = new Date(completedAt.getTime() + cacheTtlMs);
 
@@ -282,9 +378,14 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
       $set: {
         'requests.$.status': 'completed',
         'requests.$.answer': generatedAnswer,
+        'requests.$.workflowId': bestMatch?.id || null,
+        'requests.$.pageLink': pageLink || null,
+        'requests.$.steps': bestMatch?.steps || [],
         'requests.$.effectivePermissions': permissionCodes,
         'requests.$.completedAt': completedAt,
         'requests.$.expiresAt': completionCacheExpiry,
+        lastWorkflowId: bestMatch?.id || existingWindow?.lastWorkflowId || null,
+        lastWorkflowAt: completedAt,
         expiresAt: new Date(completedAt.getTime() + Math.max(quotaWindowMs, cacheTtlMs) + 60000),
       },
     }
@@ -294,7 +395,11 @@ async function processChatRequest({ user, permissionCodes = [], requestId, quest
     status: 'completed',
     requestId,
     answer: generatedAnswer,
-    source: 'generated',
+    workflowId: bestMatch?.id || null,
+    pageLink: pageLink || null,
+    steps: bestMatch?.steps || [],
+    source,
+    coverageStatus: bestMatch?.status || 'verified',
   };
 }
 

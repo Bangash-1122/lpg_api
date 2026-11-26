@@ -161,6 +161,35 @@ async function run() {
   assert.strictEqual(mockCtrlResPending.locals.activityMessage, 'chat: concurrent (pending)');
   console.log('  [PASS] Controller sets 202, Retry-After: 2, and activityMessage: chat: concurrent (pending)');
 
+  // Case C: route-aware walkthrough payload with pageLink and steps
+  chatService.processChatRequest = async () => ({
+    status: 'completed',
+    requestId: 'test-req-id-2',
+    answer: 'Here is your 5-part walkthrough...',
+    source: 'generated',
+    workflowId: 'supplier_payment_outward',
+    pageLink: {
+      label: 'Open Add Payment',
+      route: '/payments/add',
+      note: 'Opens Payment form directly.',
+    },
+    steps: ['1. Go to Payments', '2. Click Add Payment'],
+  });
+
+  const mockCtrlReqRoute = {
+    body: { requestId: 'test-req-id-2', question: 'How do I record a supplier payment?' },
+    user: { _id: '507f1f77bcf86cd799439011' },
+    permissionCodes: ['payments.create', 'payments.read'],
+  };
+  const mockCtrlResRoute = createMockRes();
+  await chatController.chat(mockCtrlReqRoute, mockCtrlResRoute);
+
+  assert.strictEqual(mockCtrlResRoute.statusCode, 200);
+  assert.strictEqual(mockCtrlResRoute._data?.data?.workflowId, 'supplier_payment_outward');
+  assert.strictEqual(mockCtrlResRoute._data?.data?.pageLink?.route, '/payments/add');
+  assert.strictEqual(mockCtrlResRoute._data?.data?.steps?.length, 2);
+  console.log('  [PASS] Controller delivers route-aware payload with workflowId, pageLink, and steps');
+
   // Restore
   chatService.processChatRequest = origProcess;
 

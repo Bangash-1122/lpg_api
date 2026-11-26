@@ -27,6 +27,22 @@ const chatRequestItemSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    workflowId: {
+      type: String,
+      default: null,
+    },
+    pageLink: {
+      type: {
+        label: { type: String, default: null },
+        route: { type: String, default: null },
+        note: { type: String, default: null },
+      },
+      default: null,
+    },
+    steps: {
+      type: [String],
+      default: [],
+    },
     effectivePermissions: {
       type: [String],
       default: [],
@@ -64,6 +80,14 @@ const chatRequestWindowSchema = new mongoose.Schema(
     requests: {
       type: [chatRequestItemSchema],
       default: [],
+    },
+    lastWorkflowId: {
+      type: String,
+      default: null,
+    },
+    lastWorkflowAt: {
+      type: Date,
+      default: null,
     },
     expiresAt: {
       type: Date,

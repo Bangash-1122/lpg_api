@@ -21,24 +21,21 @@ const env = {
     chat: {
         geminiApiKey: process.env.GEMINI_API_KEY || '',
         openAiApiKey: process.env.OPENAI_API_KEY || '',
-        apiKey:
-            process.env.CHAT_AI_API_KEY ||
-            (process.env.CHAT_AI_PROVIDER === 'openai'
-                ? process.env.OPENAI_API_KEY
-                : process.env.GEMINI_API_KEY) ||
+        apiKey: process.env.CHAT_AI_API_KEY ||
+            (process.env.CHAT_AI_PROVIDER === 'openai' ?
+                process.env.OPENAI_API_KEY :
+                process.env.GEMINI_API_KEY) ||
             process.env.AI_API_KEY ||
             process.env.OPENAI_API_KEY ||
             process.env.GEMINI_API_KEY ||
             '',
-        apiUrl:
-            process.env.CHAT_AI_API_URL ||
+        apiUrl: process.env.CHAT_AI_API_URL ||
             process.env.AI_API_URL ||
-            (process.env.CHAT_AI_PROVIDER === 'openai'
-                ? 'https://api.openai.com/v1'
-                : 'https://generativelanguage.googleapis.com/v1beta/models'),
+            (process.env.CHAT_AI_PROVIDER === 'openai' ?
+                'https://api.openai.com/v1' :
+                'https://generativelanguage.googleapis.com/v1beta/models'),
         provider: process.env.CHAT_AI_PROVIDER || (process.env.OPENAI_API_KEY ? 'openai' : 'gemini'),
-        model:
-            process.env.CHAT_AI_MODEL ||
+        model: process.env.CHAT_AI_MODEL ||
             (process.env.CHAT_AI_PROVIDER === 'openai' ? 'gpt-6.2-astra' : 'gemini-1.5-flash'),
         quotaLimit: Number(process.env.CHAT_QUOTA_LIMIT) || 10,
         quotaWindowSeconds: Number(process.env.CHAT_QUOTA_WINDOW_SECONDS) || 60,
